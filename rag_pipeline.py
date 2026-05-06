@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 import re
 from datetime import date
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Set
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -32,6 +32,20 @@ class CVRAGPipeline:
         self._lines: List[str] = []
         self._vectorizer: TfidfVectorizer | None = None
         self._matrix = None
+        
+        # Performance optimizations
+        self._answer_cache: Dict[str, Tuple[str, int]] = {}
+        self._keyword_index: Dict[str, List[int]] = {}  # keyword -> line indices
+        self._line_keywords: Dict[int, Set[str]] = {}   # line index -> keywords
+        
+        # Pre-compiled regexes for speed
+        self._date_range_re = re.compile(
+            r"\b(?P<smon>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(?P<syear>20\d{2}|19\d{2})\s*[\-–—]\s*(?:(?P<emon>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*(?P<eyear>20\d{2}|19\d{2})|(?P<present>present|current|ongoing|now))",
+            re.IGNORECASE,
+        )
+        self._duration_re = re.compile(r"\b(\d+)\s*\+?\s*(year|years|month|months)\b", re.IGNORECASE)
+        self._month_pattern_re = re.compile(r"([A-Za-z])(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)", re.IGNORECASE)
+        self._whitespace_re = re.compile(r"\s+")
 
         self._client = Groq(api_key=self.api_key) if self.api_key else None
         self._build_knowledge_base()
@@ -107,26 +121,28 @@ class CVRAGPipeline:
         return unique_tokens
 
     def _keyword_line_context(self, question: str, max_lines: int = 18) -> List[str]:
-        if not self._lines:
+        """Fast keyword lookup using pre-built index instead of scanning all lines."""
+        if not self._lines or not self._keyword_index:
             return []
 
         keywords = self._question_keywords(question)
         if not keywords:
             return []
 
-        matched_indices: List[int] = []
-        for idx, line in enumerate(self._lines):
-            low = line.lower()
-            if any(k in low for k in keywords):
-                matched_indices.append(idx)
-
+        # Use index for fast lookup
+        matched_indices: Set[int] = set()
+        for keyword in keywords:
+            if keyword in self._keyword_index:
+                matched_indices.update(self._keyword_index[keyword][:max_lines // 2])
+        
         if not matched_indices:
             return []
 
-        # Include neighboring lines to capture values on the next/previous line.
+        # Include neighboring lines and limit results
         selected: List[str] = []
         seen: set[int] = set()
-        for idx in matched_indices[: max_lines // 2]:
+        
+        for idx in sorted(matched_indices)[:max_lines // 2]:
             for j in (idx - 1, idx, idx + 1):
                 if 0 <= j < len(self._lines) and j not in seen:
                     seen.add(j)
@@ -163,7 +179,7 @@ class CVRAGPipeline:
 
         def _normalize_line(line: str) -> str:
             line = re.sub(r"([A-Za-z])(\d{4})", r"\1 \2", line)
-            line = re.sub(r"\s+", " ", line).strip()
+            line = self._whitespace_re.sub(" ", line).strip()
             return line
 
         if wants_graduation:
@@ -224,8 +240,6 @@ class CVRAGPipeline:
         if not self._lines:
             return None
 
-        duration_re = re.compile(r"\b(\d+)\s*\+?\s*(year|years|month|months)\b", re.IGNORECASE)
-
         month_map = {
             "jan": 1,
             "feb": 2,
@@ -240,16 +254,11 @@ class CVRAGPipeline:
             "nov": 11,
             "dec": 12,
         }
-        month_names = r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
-        date_range_re = re.compile(
-            rf"\b(?P<smon>{month_names})\s*(?P<syear>20\d{{2}}|19\d{{2}})\s*[\-–—]\s*(?:(?P<emon>{month_names})\s*(?P<eyear>20\d{{2}}|19\d{{2}})|(?P<present>present|current|ongoing|now))",
-            re.IGNORECASE,
-        )
 
         def _normalize_line(line: str) -> str:
             # Handle PDF extraction issues like "InternMar 2024".
-            line = re.sub(rf"([A-Za-z])({month_names})", r"\1 \2", line, flags=re.IGNORECASE)
-            line = re.sub(r"\s+", " ", line).strip()
+            line = self._month_pattern_re.sub(r"\1 \2", line)
+            line = self._whitespace_re.sub(" ", line).strip()
             return line
 
         def _to_month_number(month_text: str) -> int:
@@ -296,18 +305,18 @@ class CVRAGPipeline:
                 line = self._lines[j]
                 clean_line = _normalize_line(line)
 
-                for match in date_range_re.finditer(clean_line):
+                for match in self._date_range_re.finditer(clean_line):
                     start_month = _to_month_number(match.group("smon"))
                     start_year = int(match.group("syear"))
                     ml_start_dates.append(date(start_year, start_month, 1))
 
-                for value, unit in duration_re.findall(line):
+                for value, unit in self._duration_re.findall(line):
                     amount = int(value)
                     if unit.lower().startswith("year"):
                         total_months += amount * 12
                     else:
                         total_months += amount
-                if duration_re.search(line) or ("machine learning" in line.lower() and line not in evidence):
+                if self._duration_re.search(line) or ("machine learning" in line.lower() and line not in evidence):
                     evidence.append(clean_line)
 
         if ml_start_dates:
@@ -358,6 +367,21 @@ class CVRAGPipeline:
         if not self._chunks:
             raise ValueError("No chunks could be generated from CV text.")
 
+        # Build keyword index for ultra-fast keyword lookups
+        self._keyword_index = {}
+        self._line_keywords = {}
+        
+        # Extract all meaningful keywords from lines once
+        for line_idx, line in enumerate(self._lines):
+            keywords_in_line = set(re.findall(r"[a-z]{3,}", line.lower()))
+            self._line_keywords[line_idx] = keywords_in_line
+            
+            # Build reverse index: keyword -> line indices
+            for kw in keywords_in_line:
+                if kw not in self._keyword_index:
+                    self._keyword_index[kw] = []
+                self._keyword_index[kw].append(line_idx)
+
         self._vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english")
         corpus = [chunk.text for chunk in self._chunks]
         self._matrix = self._vectorizer.fit_transform(corpus)
@@ -393,10 +417,16 @@ class CVRAGPipeline:
         if not self._client:
             raise RuntimeError("Missing GROQ_API_KEY in .env")
 
+        # **ULTRA-FAST: Check cache first (sub-millisecond response)**
+        if question in self._answer_cache:
+            return self._answer_cache[question]
+
         # Try rule-based extraction first (most reliable)
         rule_answer = self._rule_based_answer(question)
         if rule_answer:
-            return rule_answer, 1
+            result = (rule_answer, 1)
+            self._answer_cache[question] = result
+            return result
 
         effective_top_k = min(max(top_k, 4), 8)
         retrieved_chunks = self._retrieve(question, top_k=effective_top_k)
@@ -409,11 +439,13 @@ class CVRAGPipeline:
         )
         
         if not has_strong_context:
-            return (
+            result = (
                 "I don't have information about that in the CV. "
                 "Would you like to ask the candidate directly or explore other topics from the CV?",
                 0
             )
+            self._answer_cache[question] = result
+            return result
 
         context_parts: List[str] = []
         if retrieved_chunks:
@@ -464,4 +496,8 @@ class CVRAGPipeline:
 
         answer = completion.choices[0].message.content or "I couldn't generate a response. Please try again."
         source_count = len(retrieved_chunks) + (1 if keyword_lines else 0)
-        return answer.strip(), source_count
+        result = (answer.strip(), source_count)
+        
+        # **Cache for next time (sub-millisecond future response)**
+        self._answer_cache[question] = result
+        return result
