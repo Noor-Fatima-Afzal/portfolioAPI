@@ -50,7 +50,7 @@ class CVRAGPipeline:
 
     @property
     def is_ready(self) -> bool:
-        return self._client is not None and len(self._chunks) > 0 and self._matrix is not None
+        return self._client is not None and len(self._chunks) > 0 and self._bm25 is not None
 
     @property
     def chunk_count(self) -> int:
@@ -345,6 +345,40 @@ class CVRAGPipeline:
 
         return None
 
+    def _is_first_person_question(self, question: str) -> bool:
+        """Check if question is asking in first person (you, I, my, me, we, our, etc)."""
+        q_lower = question.lower()
+        first_person_patterns = [r"\byou\b", r"\bi\b", r"\bmy\b", r"\bme\b", r"\bwe\b", r"\bour\b", r"\bus\b"]
+        return any(re.search(pattern, q_lower) for pattern in first_person_patterns)
+
+    def _convert_to_first_person(self, answer: str) -> str:
+        """Convert third-person answer to first-person."""
+        # Replace "She is" with "I am"
+        answer = re.sub(r"\bShe is\b", "I am", answer, flags=re.IGNORECASE)
+        answer = re.sub(r"\bshe is\b", "I am", answer, flags=re.IGNORECASE)
+        
+        # Replace "She has" with "I have"
+        answer = re.sub(r"\bShe has\b", "I have", answer, flags=re.IGNORECASE)
+        answer = re.sub(r"\bshe has\b", "I have", answer, flags=re.IGNORECASE)
+        
+        # Replace "she" with "I"
+        answer = re.sub(r"\bShe\b", "I", answer)
+        answer = re.sub(r"\bshe\b", "I", answer)
+        
+        # Replace "her" with "my"
+        answer = re.sub(r"\bher\b", "my", answer, flags=re.IGNORECASE)
+        
+        # Replace "Her" with "My" (capitalized)
+        answer = re.sub(r"\bHer\b", "My", answer)
+        
+        # Replace "the candidate" with "I"
+        answer = re.sub(r"\bthe candidate\b", "I", answer, flags=re.IGNORECASE)
+        
+        # Replace "the owner" with "I" or "myself"
+        answer = re.sub(r"\bthe owner\b", "I", answer, flags=re.IGNORECASE)
+        
+        return answer
+
     def _rule_based_answer(self, question: str) -> str | None:
         answer = self._extract_studying_or_graduation(question)
         if answer:
@@ -424,9 +458,15 @@ class CVRAGPipeline:
         if question in self._answer_cache:
             return self._answer_cache[question]
 
+        # Detect if question is in first person
+        is_first_person = self._is_first_person_question(question)
+
         # Try rule-based extraction first (most reliable)
         rule_answer = self._rule_based_answer(question)
         if rule_answer:
+            # Convert to first person if needed
+            if is_first_person:
+                rule_answer = self._convert_to_first_person(rule_answer)
             result = (rule_answer, 1)
             self._answer_cache[question] = result
             return result
@@ -498,6 +538,11 @@ class CVRAGPipeline:
         )
 
         answer = completion.choices[0].message.content or "I couldn't generate a response. Please try again."
+        
+        # Convert to first person if question is in first person
+        if is_first_person:
+            answer = self._convert_to_first_person(answer)
+        
         source_count = len(retrieved_chunks) + (1 if keyword_lines else 0)
         result = (answer.strip(), source_count)
         
