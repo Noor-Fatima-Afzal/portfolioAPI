@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+import os
+import uvicorn
 
 from rag_pipeline import CVRAGPipeline
 
@@ -26,8 +28,28 @@ app = FastAPI(
 pipeline = CVRAGPipeline()
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Called when the application starts."""
+    print("✅ API is starting up...")
+    print(f"✅ CV Pipeline Ready: {pipeline.is_ready}")
+    print(f"✅ Chunks Loaded: {pipeline.chunk_count}")
+
+
+@app.get("/")
+def root() -> dict:
+    """Root endpoint - confirms API is running."""
+    return {
+        "message": "Portfolio CV RAG API is running",
+        "docs_url": "/docs",
+        "health_url": "/health",
+        "chat_url": "/chat"
+    }
+
+
 @app.get("/health")
 def health() -> dict:
+    """Health check endpoint for deployment platforms."""
     return {
         "status": "ok",
         "cv_loaded": pipeline.is_ready,
@@ -84,4 +106,19 @@ def chat(request: ChatRequest) -> ChatResponse:
         sources_used=source_count,
         confidence=confidence,
         uses_cv_data=uses_cv,
+    )
+
+
+# Production entry point - respects PORT environment variable
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "0.0.0.0")
+    
+    print(f"🚀 Starting API server on {host}:{port}")
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=os.getenv("RELOAD", "false").lower() == "true",
+        log_level="info"
     )
