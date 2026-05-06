@@ -9,8 +9,7 @@ from typing import List, Tuple, Dict, Set
 from dotenv import load_dotenv
 from groq import Groq
 from pypdf import PdfReader
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from rank_bm25 import BM25Okapi
 
 
 @dataclass
@@ -30,8 +29,7 @@ class CVRAGPipeline:
         self._chunks: List[Chunk] = []
         self._full_text: str = ""
         self._lines: List[str] = []
-        self._vectorizer: TfidfVectorizer | None = None
-        self._matrix = None
+        self._bm25: BM25Okapi | None = None
         
         # Performance optimizations
         self._answer_cache: Dict[str, Tuple[str, int]] = {}
@@ -382,26 +380,31 @@ class CVRAGPipeline:
                     self._keyword_index[kw] = []
                 self._keyword_index[kw].append(line_idx)
 
-        self._vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english")
-        corpus = [chunk.text for chunk in self._chunks]
-        self._matrix = self._vectorizer.fit_transform(corpus)
+        # Initialize BM25 for chunk retrieval (pure Python, no scipy/numpy needed)
+        corpus_tokens = [chunk.text.lower().split() for chunk in self._chunks]
+        self._bm25 = BM25Okapi(corpus_tokens)
 
     def _retrieve(self, question: str, top_k: int = 4) -> List[Chunk]:
         """Retrieve relevant chunks with strict relevance thresholds to prevent hallucinations."""
-        if self._vectorizer is None or self._matrix is None:
+        if self._bm25 is None:
             return []
 
-        question_vec = self._vectorizer.transform([question])
-        scores = cosine_similarity(question_vec, self._matrix).flatten()
-
-        if scores.size == 0:
+        # Tokenize question
+        question_tokens = question.lower().split()
+        if not question_tokens:
             return []
 
-        top_indices = scores.argsort()[::-1][:top_k]
+        # Get BM25 scores
+        scores = self._bm25.get_scores(question_tokens)
+
+        if len(scores) == 0:
+            return []
+
+        # Get top-k indices by score
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
         
-        # STRICT: Only return chunks with meaningful relevance (>0.05 cosine similarity)
-        # This prevents returning random chunks that could cause hallucinations
-        MIN_RELEVANCE_THRESHOLD = 0.05
+        # STRICT: Only return chunks with meaningful relevance (BM25 score > 2.0)
+        MIN_RELEVANCE_THRESHOLD = 2.0
         relevant_chunks = []
         
         for idx in top_indices:
