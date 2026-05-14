@@ -34,6 +34,11 @@ async def startup_event():
     print("✅ API is starting up...")
     print(f"✅ CV Pipeline Ready: {pipeline.is_ready}")
     print(f"✅ Chunks Loaded: {pipeline.chunk_count}")
+     if not pipeline.is_ready:
+          print("⚠️ WARNING: CV pipeline not ready!")
+          print(f"   - GROQ_API_KEY set: {'GROQ_API_KEY' in os.environ}")
+          print(f"   - CV_PATH: {pipeline.cv_path}")
+          print(f"   - CV file exists: {os.path.exists(pipeline.cv_path)}")
 
 
 @app.get("/")
@@ -116,7 +121,7 @@ if __name__ == "__main__":
     
     print(f"🚀 Starting API server on {host}:{port}")
     uvicorn.run(
-        "main:app",
+        "app:app",
         host=host,
         port=port,
         reload=os.getenv("RELOAD", "false").lower() == "true",
